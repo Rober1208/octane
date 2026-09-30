@@ -2786,6 +2786,81 @@ function collectComponentLocals(componentNode) {
 	return locals;
 }
 
+// Every name a callback binds for code in its own body: its params, a function
+// expression's own name, and each declaration at ANY statement depth, where
+// collectComponentLocals reads only the top level. A name from a sibling block is
+// included too, which is sound only because a name is threaded when code reads it
+// free: that read already means whatever the name resolves to at the call site.
+// collectFreeIdentifiers must therefore never report a nested scope's own names
+// (a `@{ … }` block's locals, a `@catch` param) as free. Nested functions and
+// render bodies bind their own names, and are visited on their own.
+function collectCallbackBindings(fn) {
+	const names = new Set();
+	for (const p of fn.params || []) collectBindings(p, names);
+	if (fn.type === 'FunctionExpression' && fn.id) names.add(fn.id.name);
+	visit(fn.body);
+	return names;
+
+	function visit(node) {
+		if (node == null || typeof node !== 'object') return;
+		if (Array.isArray(node)) {
+			for (const statement of node) visit(statement);
+			return;
+		}
+		switch (node.type) {
+			case 'VariableDeclaration':
+				for (const d of node.declarations || []) collectBindings(d.id, names);
+				return;
+			case 'FunctionDeclaration':
+			case 'ClassDeclaration':
+				if (node.id) names.add(node.id.name);
+				return;
+			case 'BlockStatement':
+				visit(node.body);
+				return;
+			case 'IfStatement':
+				visit(node.consequent);
+				visit(node.alternate);
+				return;
+			case 'ForStatement':
+				visit(node.init);
+				visit(node.body);
+				return;
+			case 'ForInStatement':
+			case 'ForOfStatement':
+				visit(node.left);
+				visit(node.body);
+				return;
+			case 'WhileStatement':
+			case 'DoWhileStatement':
+			case 'LabeledStatement':
+				visit(node.body);
+				return;
+			case 'TryStatement':
+				visit(node.block);
+				if (node.handler?.param) collectBindings(node.handler.param, names);
+				visit(node.handler?.body);
+				visit(node.finalizer);
+				return;
+			case 'SwitchStatement':
+				for (const c of node.cases || []) visit(c.consequent);
+				return;
+			default:
+				return;
+		}
+	}
+}
+
+// Whether `node` reads a name an enclosing callback binds. Such a name is in scope
+// where `node` is written, but not in the owning body a hoisted helper lands in.
+function readsCallbackScope(node, callbackScope) {
+	if (callbackScope == null || callbackScope.size === 0) return false;
+	for (const name of collectFreeIdentifiers(node, [])) {
+		if (callbackScope.has(name)) return true;
+	}
+	return false;
+}
+
 /**
  * Compute the set of component-local names that are guaranteed STABLE across
  * renders. Used by the auto-callback pass below to decide which `const X =
@@ -4046,6 +4121,12 @@ function collectFreeIdentifiers(root, initiallyBound, ignoreNodes = null) {
 			walk(n.body, scope);
 			return;
 		}
+		// The compiler's own renderable child hole (a normalized `{expr}` or
+		// `@{ … }` child) shares the prefix, but its expression is runtime code.
+		if (t === 'TSRXExpression') {
+			walk(n.expression, scope);
+			return;
+		}
 		if (t.startsWith('TS')) return;
 
 		if (t === 'Identifier') {
@@ -4149,12 +4230,34 @@ function collectFreeIdentifiers(root, initiallyBound, ignoreNodes = null) {
 			return;
 		}
 
-		// CatchClause introduces its param.
+		// CatchClause introduces its param, and a `@catch (error, reset)` clause
+		// also its reset param.
 		if (t === 'CatchClause') {
 			const newScope = new Set(scope);
 			if (n.param) collectBindings(n.param, newScope);
+			if (n.resetParam) collectBindings(n.resetParam, newScope);
 			if (n.param) walkPatternExpressions(n.param, newScope);
 			walk(n.body, newScope);
+			return;
+		}
+
+		// A `@{ … }` block's setup declarations are scoped to its setup and render
+		// output, like a block statement's. Otherwise a block-local reads as a
+		// capture of any outer name it shares, which a caller would thread from a
+		// call site where that outer name may not be in scope.
+		if (t === 'JSXCodeBlock') {
+			const newScope = new Set(scope);
+			for (const stmt of n.body || []) {
+				if (stmt.type === 'VariableDeclaration') {
+					for (const d of stmt.declarations || []) collectBindings(d.id, newScope);
+				} else if (stmt.type === 'FunctionDeclaration' && stmt.id) {
+					newScope.add(stmt.id.name);
+				}
+			}
+			for (const key in n) {
+				if (AST_WALK_SKIP_KEYS.has(key)) continue;
+				walk(n[key], newScope);
+			}
 			return;
 		}
 
@@ -8187,14 +8290,18 @@ function alwaysCompletesAbruptly(statements) {
  * template, so normalize every component-level early return through `?? null`.
  * This preserves one evaluation and every renderable value while making bare or
  * explicitly-undefined returns an unambiguous empty output. Nested functions are
- * separate execution scopes and remain untouched.
+ * separate execution scopes and remain untouched. So is JSX: a return inside a
+ * directive arm is that arm's early exit, which the arm lowers exactly as it
+ * does in a template body, so the server and client ranges agree.
  */
 function normalizeOwnRenderableReturns(statement, preserveJsx = false) {
 	return mapAst(statement, (node) => {
 		if (
 			node.type === 'FunctionDeclaration' ||
 			node.type === 'FunctionExpression' ||
-			node.type === 'ArrowFunctionExpression'
+			node.type === 'ArrowFunctionExpression' ||
+			JSX_CHILDREN_BEARING_TYPES.has(node.type) ||
+			SETUP_VALUE_DIRECTIVE_TYPES.has(node.type)
 		)
 			return node;
 		if (node.type !== 'ReturnStatement') return null;
@@ -12426,7 +12533,7 @@ function ssrCompileBodyWithMapTemps(
 		// itself. rewriteEarlyExits wants the array.
 		const bodyStmts =
 			node.body && node.body.type === 'BlockStatement' ? node.body.body || [] : node.body || [];
-		const bodyRewritten = rewriteEarlyExits(bodyStmts);
+		const bodyRewritten = rewriteEarlyExits(unwrapOutputCodeBlock(bodyStmts));
 		statements = [];
 		jsxNodes = [];
 		for (const child of bodyRewritten) {
@@ -16252,7 +16359,7 @@ function compileFunctionBody(node, ctx, name, parentNs = 'html', cssHash = null,
 		statements = node.body.body || [];
 		jsxNodes = node.body.render ? [node.body.render] : [];
 	} else {
-		const bodyRewritten = rewriteEarlyExits(node.body);
+		const bodyRewritten = rewriteEarlyExits(unwrapOutputCodeBlock(node.body));
 		statements = [];
 		jsxNodes = [];
 		for (const child of bodyRewritten) {
@@ -16454,11 +16561,11 @@ function compileFunctionBody(node, ctx, name, parentNs = 'html', cssHash = null,
 	// Rewrite hook calls and `<tsrx>` blocks in statements before printing them.
 	// A `<tsrx>` block at expression position (e.g. `const f = <tsrx>...</tsrx>`)
 	// is hoisted as a render function in inlinedSubs and replaced with an
-	// identifier reference. Suitable for top-level render-prop patterns where
-	// the block doesn't capture local arrow params.
+	// identifier reference. One that reads a setup callback's names stays for
+	// rewriteJsxValues, which compiles it in place inside that callback.
 	const rewrittenStatements = preparedStatements
 		.map((s) => rewriteHookCalls(s, ctx, name, options?.localHookSlots === true))
-		.map((s) => rewriteTsrxBlocks(s, ctx, name, inlinedSubs))
+		.map((s) => rewriteTsrxBlocks(s, ctx, name, inlinedSubs, 'html', null, true))
 		// JSX component element at VALUE position in setup (e.g. `const el = <App/>`)
 		// → createElement(App, props). Output JSX (jsxNodes) was already split off.
 		.map((s) => rewriteJsxValues(s, ctx));
@@ -21220,6 +21327,11 @@ function rewriteExtractedFragmentHole(expression, ctx, parentNs) {
 	}
 	const fold = ctx._foldCtx;
 	if (fold?.compInlinedSubs === undefined) return lowered;
+	// The owner's body sits outside any callback the directive is written in, so a
+	// sub-template reading that callback's names compiles in place instead. The
+	// hole props are built at the call site, inside the callback, so its closure
+	// sees them.
+	if (readsCallbackScope(lowered, ctx._callbackScopeNames)) return rewriteJsxValues(lowered, ctx);
 	return rewriteTsrxBlocks(lowered, ctx, 'fragment', fold.compInlinedSubs, parentNs, fold.cssHash);
 }
 
@@ -22016,8 +22128,10 @@ function lowerHostFragment(
  *
  * In both cases the helper is added to `inlinedSubs` (visible in the
  * surrounding component-body scope) so it captures the parent component's
- * locals via closure. It cannot capture params of nested arrows — see
- * compiler README.
+ * locals via closure. The names a callback inside `node` binds are not in scope
+ * there, so with `leaveCallbackReads` a sub-template that reads one is left in
+ * place, for the rewriteJsxValues pass that must follow to compile inside that
+ * callback.
  */
 function rewriteTsrxBlocks(
 	node,
@@ -22026,8 +22140,15 @@ function rewriteTsrxBlocks(
 	inlinedSubs,
 	parentNs = 'html',
 	cssHash = null,
+	leaveCallbackReads = false,
 ) {
-	return mapAst(node, (n) => {
+	return rewrite(node, null);
+
+	function rewrite(root, callbackScope) {
+		return mapAst(root, (n) => visit(n, callbackScope));
+	}
+
+	function visit(n, callbackScope) {
 		if (n.type === 'Tsrx' || n.type === 'Tsx') {
 			const helperName = `__tsrx$${ctx.nextHelperId++}`;
 			const fakeBody = {
@@ -22041,6 +22162,8 @@ function rewriteTsrxBlocks(
 			return inheritOriginLoc(b.id(helperName), n);
 		}
 		if (n.type === 'ArrowFunctionExpression' && n.body && n.body.type === 'JSXCodeBlock') {
+			// The callback's names do not exist in the body the helper would join.
+			if (readsCallbackScope(n, callbackScope)) return n;
 			// `() => @{ … }` — new sub-template form. Hoist as a regular component
 			// body so its body.body (setup) + body.render (JSX) feed back through
 			// the standard compileFunctionBody path.
@@ -22061,8 +22184,24 @@ function rewriteTsrxBlocks(
 			);
 			return inheritOriginLoc(b.id(helperName), n);
 		}
+		if (leaveCallbackReads && isFunctionNode(n)) {
+			const scope = new Set(callbackScope);
+			for (const name of collectCallbackBindings(n)) scope.add(name);
+			let out = n;
+			for (const key in n) {
+				if (key === 'loc' || key === 'start' || key === 'end' || key === 'metadata') continue;
+				const child = n[key];
+				if (child === null || typeof child !== 'object') continue;
+				const mapped = rewrite(child, scope);
+				if (mapped !== child) {
+					if (out === n) out = { ...n };
+					out[key] = mapped;
+				}
+			}
+			return out;
+		}
 		return null;
-	});
+	}
 }
 
 /**
@@ -22581,7 +22720,9 @@ function rewriteJsxValues(node, ctx, eagerMapCallbackRoots = false, eagerMapCall
 				// `@{ … }` child block has no arms, so lowerJsxChild compiles it in place.
 				ctx._valueDirectiveLowering = null;
 			} else {
-				const introduced = collectComponentLocals(n);
+				// Including names bound in the callback's nested blocks, which a fold
+				// written in one of those blocks reads just the same.
+				const introduced = collectCallbackBindings(n);
 				const extended = new Set(previousLocals);
 				for (const name of introduced) extended.add(name);
 				ctx.currentComponentLocals = extended;
@@ -34322,12 +34463,16 @@ function isJsxNode(node) {
 	if (node.type === 'JSXElement' || node.type === 'JSXFragment') return true;
 	// New TSRX directive nodes — always JSX-position. normalizeChildren will
 	// lower them to IfStatement / ForOfStatement / TryStatement / SwitchStatement
-	// when planJsx runs over them.
+	// when planJsx runs over them. A child `@{ … }` block in a statement list is
+	// a directive arm's output node, never setup: normalizeChildren makes a
+	// render-only block transparent and gives a setup-bearing one its own scope,
+	// exactly as it does for a block among element children.
 	if (
 		node.type === 'JSXIfExpression' ||
 		node.type === 'JSXForExpression' ||
 		node.type === 'JSXTryExpression' ||
 		node.type === 'JSXSwitchExpression' ||
+		node.type === 'JSXCodeBlock' ||
 		node.type === 'JSXExpressionContainer' ||
 		node.type === 'JSXText' ||
 		node.type === 'JSXStyleElement'
@@ -34356,6 +34501,18 @@ function isWrappedJsxDirective(node) {
 		type === 'JSXTryExpression' ||
 		type === 'JSXSwitchExpression'
 	);
+}
+
+// `@for` item bodies and `@switch` cases wrap a child `@{ … }` block written as
+// their output in an ExpressionStatement. The parser admits a block only as a
+// body's final statement, so unwrap just that one. A block inside plain JS
+// control flow in the body's setup is wrapped the same way and stays a
+// JavaScript expression, exactly like an element written there.
+function unwrapOutputCodeBlock(statements) {
+	const last = statements[statements.length - 1];
+	return last?.type === 'ExpressionStatement' && last.expression?.type === 'JSXCodeBlock'
+		? [...statements.slice(0, -1), last.expression]
+		: statements;
 }
 
 function bodyContainsJsx(node) {
