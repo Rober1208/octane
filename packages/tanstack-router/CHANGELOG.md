@@ -1,5 +1,51 @@
 # @octanejs/tanstack-router
 
+## 0.1.60
+
+### Patch Changes
+
+- 590129a: `RouterClient` no longer wraps the router in a Suspense boundary while
+  `hydrate()` runs, matching upstream, which suspends through `<Await>` with no
+  fallback.
+
+  The boundary caused two problems. With `hydrateRoot`, it had no match in the
+  server HTML from `RouterServer`, so hydration reported a mismatch, removed the
+  server DOM, and rebuilt the page on the client. With `createRoot`, its empty
+  fallback committed first, so the hydrated tree counted as a Suspense retry and
+  stayed hidden for up to 300ms. In both cases, the root layout was blank while
+  an `ssr: false` child route was still pending.
+
+  `RouterClient` now suspends at the root. `hydrateRoot` keeps and adopts the
+  server DOM, and the root layout and the child's pending component appear as soon
+  as `hydrate()` settles.
+- de2685e: Key head and body assets by content instead of list position.
+
+  `HeadContent` keyed each tag by its index, and manifest `modulepreload` links
+  precede the stylesheet. Navigating between routes with different preload counts
+  shifted the stylesheet's index, remounted its `Asset`, and removed and re-added
+  the `<link rel="stylesheet">`, flashing unstyled content in production builds.
+  `HeadContent` now keys tags by content, as `@tanstack/react-router` does, with
+  identical tags told apart by occurrence. `Scripts` uses the same keys, so body
+  scripts are no longer re-created when the hydration barrier is removed. `Asset`
+  compares `attrs` by value, so a rebuilt tag list no longer re-mounts unchanged
+  assets, and a mounted asset's element can no longer be adopted by another.
+- b1d7e24: Keep a route match suspended until the state that holds it has ended, so the
+  route never renders before its loader data exists.
+
+  Two cases could lock up the page before this fix: a hydrated `ssr: false` route
+  whose client loader outlasted `pendingMinMs`, and a loader that redirected to a
+  route whose loader waits on a timer or the network. The route match
+  suspended on a different router promise in each state, but through `use()`,
+  which tracks promises by call position. Once the match changed state, a retry
+  got back the earlier, already settled promise. Router-core marks its settled
+  promises `status: 'resolved'`, which `use()` reads as still pending, so each
+  retry suspended again at once, on a microtask. Timers and network callbacks
+  never ran, so the loader could never finish.
+
+  The match now throws the relevant promise, like upstream, so no earlier promise
+  can be reused. A redirected match waits for its next store update instead of its
+  load promise, which router-core has already resolved by then.
+
 ## 0.1.59
 
 ### Patch Changes

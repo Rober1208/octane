@@ -474,7 +474,7 @@
     },
     {
       "name": "@octanejs/i18next",
-      "version": "0.1.51",
+      "version": "0.1.52",
       "category": "Content",
       "upstream": { "package": "react-i18next", "version": "17.0.9" },
       "surface": "Complete runtime port of react-i18next 17.0.9: useTranslation, I18nextProvider/context, Trans/TransWithoutContext, IcuTrans/IcuTransWithoutContext, Translation, the withTranslation/withSSR HOCs, useSSR, namespace reporting, initialization/default helpers, and the root ICU helper exports over the unchanged i18next core.",
@@ -594,7 +594,7 @@
     },
     {
       "name": "@octanejs/livestore",
-      "version": "0.0.26",
+      "version": "0.0.27",
       "category": "Data",
       "upstream": { "package": "@livestore/react", "version": "0.4.0" },
       "surface": "Ports the complete stable renderer surface (registry provider/access, Suspense store loading and augmentation, reactive queries, client documents, and sync status) plus the exported experimental LiveList over LiveStore's unchanged 0.4.0 framework-neutral packages.",
@@ -827,7 +827,7 @@
     },
     {
       "name": "@octanejs/rainbowkit",
-      "version": "0.0.39",
+      "version": "0.0.40",
       "category": "Web3",
       "upstream": { "package": "@rainbow-me/rainbowkit", "version": "2.2.11" },
       "surface": "Octane-native RainbowKitProvider, ConnectButton and ConnectButton.Custom, WalletButton, connect/account/chain modal hooks, connector selection, account/chain actions, native accessible dialogs, and light/dark/midnight themes.",
@@ -1052,7 +1052,7 @@
     },
     {
       "name": "@octanejs/solana-kit",
-      "version": "0.0.27",
+      "version": "0.0.28",
       "category": "Web3",
       "upstream": {
         "package": "@solana/react",
@@ -1280,7 +1280,7 @@
     },
     {
       "name": "@octanejs/tanstack-query",
-      "version": "0.1.57",
+      "version": "0.1.58",
       "category": "Data",
       "upstream": { "package": "@tanstack/react-query", "version": "5.102.8" },
       "surface": "Complete published root adapter and neutral core re-exports. Exact runtime export comparison, 213 public value/type probes, 404 pristine and 404 adapted runtime registrations, and 167 pristine/adapted type registrations.",
@@ -1294,7 +1294,7 @@
     },
     {
       "name": "@octanejs/tanstack-router",
-      "version": "0.1.59",
+      "version": "0.1.60",
       "category": "Routing",
       "upstream": { "package": "@tanstack/react-router", "version": "1.170.18" },
       "surface": "Octane's TanStack Router binding: typed route factories and hooks, the full Match pipeline and lifecycle, file routes with TSRX-aware generator integration, full Link navigation/preloading/masking behavior, blocking, Await/deferred hydration, scroll restoration, lazy routes, not-found handling, document/head assets, and client/server SSR entries.",
@@ -1308,7 +1308,7 @@
     },
     {
       "name": "@octanejs/tanstack-router-ssr-query",
-      "version": "0.0.50",
+      "version": "0.0.51",
       "category": "Routing",
       "upstream": { "package": "@tanstack/react-router-ssr-query", "version": "1.167.1" },
       "surface": "Surface-present for the pinned adapter's only runtime entrypoint (`Options` and `setupRouterSsrQueryIntegration`). The metadata-only `./package.json` subpath is intentionally omitted. A representative differential covers provider-backed SSR, existing-wrapper preservation, setup mutations, and the wrapping control; upstream has no runtime suite, and type evidence is the upstream source compile plus the adapted Octane compile, so verification remains recorded-unverified.",
@@ -1547,7 +1547,7 @@
     },
     {
       "name": "@octanejs/wagmi",
-      "version": "0.0.39",
+      "version": "0.0.40",
       "category": "Web3",
       "upstream": { "package": "wagmi", "version": "3.7.7" },
       "surface": "WagmiProvider and createConfig over @wagmi/core 3.6.5, with config, connection, connect, disconnect, switch-connection, switch-chain, connectors, connections, chains, balance, contract read/simulate/write, transaction send/wait, and message-signing hooks.",
