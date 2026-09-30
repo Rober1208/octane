@@ -97,8 +97,10 @@ import {
 	applyElementDefaultProps,
 	childElementKey,
 	childrenIterator,
+	describeTextareaChild,
 	escapeMappedElementKey,
 	resolveLazyDefaultProps as lazyResolvedProps,
+	textareaChildText,
 } from './shared-value-helpers.js';
 import {
 	__profileBail,
@@ -11195,6 +11197,11 @@ function renderReturnedValue(block: Block, out: unknown, reset?: true): void {
 			// text/component values between the borrowed markers while the block
 			// remains their owner. This keeps hydration byte-preserving for `return
 			// null` / `false` / `''` components (including memo wrappers).
+			// A component returned where the server rendered a primitive borrows the
+			// range too, so the server's text stays inside every range below it,
+			// where a return slot adopts it or discards it for an element or a list.
+			// A marker minted in front of that text would outlive an attempt that
+			// suspends and hide the text from the retry.
 			const returnHydration = activeHydration();
 			if (
 				returnHydration !== null &&
@@ -11205,7 +11212,8 @@ function renderReturnedValue(block: Block, out: unknown, reset?: true): void {
 				block.startMarker.nodeType === 8 &&
 				block.endMarker.nodeType === 8 &&
 				(getNextSibling(block.startMarker) === block.endMarker ||
-					returnHydration.isUnframedRootRange(block.startMarker, block.endMarker))
+					returnHydration.isUnframedRootRange(block.startMarker, block.endMarker) ||
+					(isComponentDescriptor && returnHydration.holdsServerText(block)))
 			) {
 				const borrowed: ChildSlot = {
 					__kind: 'childSlot',
@@ -18593,6 +18601,59 @@ class HydrationCapability {
 		return false;
 	}
 
+	/**
+	 * Before a child slot's first hydrating render of a list, a fragment, a keyed
+	 * element, or a portal, or of an element outside a range of its own. None of
+	 * them serializes as bare text: a list frames each primitive item in a range
+	 * of its own, and a portal leaves only a `<!---->` placeholder. Text at the
+	 * cursor where the value begins, heading the slot's `adopted` range or alone
+	 * before `end` in `parent`, is what the server rendered for a primitive, which
+	 * the value cannot adopt. Report it as a structural mismatch and remove the
+	 * server content up to `end`, so the caller builds the value as a client mount
+	 * would. Returns whether it did. A lone element's range is claimHostRange's.
+	 */
+	discardServerText(
+		scope: Scope,
+		slotKey: number,
+		parent: Node,
+		end: Node | null,
+		value: unknown,
+		list: boolean,
+		adopted: boolean,
+	): boolean {
+		const text = this.node;
+		if (
+			text === null ||
+			text.nodeType !== 3 ||
+			!(list || (value as any)?.$$kind === PORTAL_TAG || (!adopted && isHostDescriptor(value))) ||
+			(!adopted && (domNode(text).parentNode !== parent || getNextSibling(text) !== end))
+		)
+			return false;
+		if (PRESENTATION_HYDRATION?.revision !== undefined) presentationMiss();
+		// Captures that changed before a dormant boundary activated legitimately
+		// differ from the server's; still rebuild, but there is nothing to report.
+		if (!this.staleServerValues) {
+			noteRecoverableHydrationError(() => new Error(formatClientError(51)));
+			if (process.env.NODE_ENV !== 'production') {
+				// A return slot has no site of its own; name the returning component.
+				const loc = siteLoc(scope, slotKey) || componentSourceLoc(scope.block.body);
+				if (loc)
+					warnHydrationStructuralMismatch(
+						loc,
+						list
+							? 'a renderable list range'
+							: (value as any).$$kind === PORTAL_TAG
+								? 'a portal'
+								: `<${(value as ElementDescriptor).type as string}>`,
+						describeHydrationNode(text),
+					);
+			}
+		}
+		removeRange(text, end);
+		this.node = end;
+		return true;
+	}
+
 	recordTextMismatch(node: Text, loc: string | undefined, server: string | null): void {
 		// Text already repaired from newer captures is not a server/client mismatch.
 		if (this.staleServerValues) return;
@@ -18618,6 +18679,39 @@ class HydrationCapability {
 
 	removeRange(start: Node, end: Node): void {
 		removeHydrationRange(start, end);
+	}
+
+	/**
+	 * Runs before the first hydrating render of a text or empty value `str` in a
+	 * child slot that adopted the server's `<!--[-->…<!--]-->` range. The value
+	 * serializes as at most one text node there, which the slot adopts when it
+	 * leads the range. Anything else in the range is server content the client
+	 * cannot adopt, such as an element or component the server rendered for a
+	 * value the client renders as text or nothing. Discard it and report the
+	 * recovery, as claimHostRange does for a host descriptor.
+	 */
+	discardUnadoptedText(scope: Scope, slotKey: number, state: ChildSlot, str: string): void {
+		const end = state.end!;
+		const first = getNextSibling(state.start!)!;
+		const kept = str !== '' && first.nodeType === 3;
+		const stale = kept ? getNextSibling(first)! : first;
+		if (stale === end) return;
+		if (PRESENTATION_HYDRATION?.revision !== undefined) presentationMiss();
+		// Captures that changed before a dormant boundary activated legitimately
+		// differ from the server's; still recover, but there is nothing to report.
+		if (!this.staleServerValues) {
+			noteRecoverableHydrationError(() => new Error(formatClientError(51)));
+			if (process.env.NODE_ENV !== 'production') {
+				const loc = siteLoc(scope, slotKey);
+				if (loc) {
+					const client = str === '' ? 'nothing' : `text ${JSON.stringify(str)}`;
+					this.warnStructural(loc, kept ? `the end of ${client}` : client, this.describe(stale));
+				}
+			}
+		}
+		removeRange(stale, end);
+		// Leave the cursor where a clean range would, never on a removed node.
+		if (!kept) this.node = end;
 	}
 
 	parseSeeds(raw: string): unknown[] | null {
@@ -18735,6 +18829,20 @@ class HydrationCapability {
 
 	isUnframedRootRange(start: Node, end: Node): boolean {
 		return this.unframedRootRanges.get(start) === end;
+	}
+
+	/**
+	 * Whether `block`'s server range holds only unclaimed text at the cursor:
+	 * what the server rendered for a primitive.
+	 */
+	holdsServerText(block: Block): boolean {
+		const text = this.node;
+		return (
+			text !== null &&
+			text.nodeType === 3 &&
+			getNextSibling(block.startMarker!) === text &&
+			getNextSibling(text) === block.endMarker
+		);
 	}
 
 	/** Record the first node outside a root-owned range exactly once. */
@@ -18991,6 +19099,19 @@ class HydrationCapability {
 		}
 		this.node = null;
 		this.rootRemainder = null;
+	}
+
+	/**
+	 * Whether the server framed `el`'s only child in a `<!--[-->…<!--]-->` range
+	 * holding something other than one text node or nothing. htext unwraps a
+	 * text-only frame; any other framed content belongs to a child slot.
+	 */
+	framesSlotContent(el: Node): boolean {
+		const first = getFirstChild(el);
+		if (!this.isOpen(first)) return false;
+		let next = getNextSibling(first);
+		if (next !== null && next.nodeType === 3) next = getNextSibling(next);
+		return !this.isClose(next);
 	}
 
 	htext(el: Node, text: string, loc?: string): Text {
@@ -19649,6 +19770,61 @@ export function htextSwap(posNode: Node | null, value: unknown): Text {
 	const parent = (STAGED_DOM?.view(posNode!) ?? posNode!).parentNode!;
 	(STAGED_DOM?.view(parent) ?? parent).replaceChild(t, posNode!);
 	return t;
+}
+
+function rejectTextareaChild(child: unknown): never {
+	throw new Error(formatClientError(336, describeTextareaChild(child, isElementDescriptor)));
+}
+
+// One part of a <textarea>'s folded children: a `{x as string}` hole keeps
+// text-binding coercion, anything else is a renderable child that must be text.
+function textareaPartText(part: unknown, textHole: boolean): string {
+	return textHole ? coerceText(part) : textareaChildText(part, rejectTextareaChild);
+}
+
+function joinTextareaParts(
+	parts: readonly unknown[],
+	textHoles: string | undefined,
+	read: (handle: SignalHandle<unknown>) => unknown,
+): string {
+	let text = '';
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i];
+		text += textareaPartText(
+			isSignalHandle(part) ? read(part) : part,
+			textHoles !== undefined && textHoles.charCodeAt(i) === 116, // 't'
+		);
+	}
+	return text;
+}
+
+/**
+ * @internal A <textarea>'s authored children, folded into the one string its
+ * template binds as the host's only Text node. Textarea content is RCDATA, so
+ * the compiler cannot give its holes `<!>` placeholders or let the server frame
+ * them (the parser would keep either as literal text). `textHoles` marks the
+ * `{x as string}` parts with a 't'. With a signal handle among the parts the
+ * result is one derived handle over them, so the ordinary direct text binding
+ * subscribes to every signal and rewrites the whole text when any changes.
+ */
+export function textareaText(parts: unknown[], textHoles?: string): unknown {
+	let handles: SignalHandle<unknown>[] | undefined;
+	for (const part of parts) if (isSignalHandle(part)) (handles ??= []).push(part);
+	if (handles === undefined) return joinTextareaParts(parts, textHoles, readSignalBinding);
+	const signals = handles;
+	return {
+		[SIGNAL_HANDLE]: true,
+		kind: 'derived',
+		key: signals.map((handle) => handle.key).join('+'),
+		[SIGNAL_BINDING_READ]: () => joinTextareaParts(parts, textHoles, readSignalBinding),
+		get: () => joinTextareaParts(parts, textHoles, (handle) => handle.get()),
+		[SIGNAL_BINDING_SUBSCRIBE](notify: () => void, onRetire?: () => void) {
+			const stops = signals.map((handle) => handle[SIGNAL_BINDING_SUBSCRIBE](notify, onRetire));
+			return () => {
+				for (const stop of stops) stop();
+			};
+		},
+	} as unknown as SignalHandle<string>;
 }
 
 /** @internal Text holes in authored binding views retain an addressable range, including when empty. */
@@ -23985,7 +24161,7 @@ export function setHostPropSources(
 			props.get('checked')?.value,
 			props.get('defaultChecked')?.value,
 			props.get('multiple')?.value,
-			hasNestedChildren,
+			hasNestedChildren || props.has('children'),
 		);
 	return resolved;
 }
@@ -26985,6 +27161,9 @@ interface ControlledState {
 	formSeen: boolean;
 	/** Previous final <select multiple> mode. */
 	formMultiple: boolean;
+	/** A textarea's children writer was present at the previous commit, so its
+	 *  live child binding may still own Text inside the element. */
+	formChildren: boolean;
 }
 
 /**
@@ -27187,6 +27366,7 @@ function armControlledBase(el: Element): ControlledState {
 			queued: false,
 			formSeen: false,
 			formMultiple: false,
+			formChildren: false,
 		};
 		(STAGED_DOM?.view(el as any) ?? (el as any)).$$ctrl = ctrl;
 		// The restore pass rides the delegated dispatchers — an armed control
@@ -27906,7 +28086,7 @@ function applyFormControlValues(
 	checked: unknown,
 	defaultChecked: unknown,
 	multiple: unknown,
-	hasNestedChildren = false,
+	hasChildren = false,
 ): void {
 	const ctrl = armControlled(el);
 	const first = !ctrl.formSeen;
@@ -27949,15 +28129,21 @@ function applyFormControlValues(
 
 	if (tag === 'textarea') {
 		const textarea = el as HTMLTextAreaElement;
+		// Octane textarea children, whether authored, spread-held, or `children=`,
+		// are a live text binding that owns the default. It only holds DOM when a
+		// children writer rendered at the previous commit.
+		const childrenOwned = ctrl.formChildren;
+		ctrl.formChildren = hasChildren;
 		setValue(textarea, value);
 		if (value == null) {
 			if (defaultValue != null) setDefaultValue(textarea, defaultValue, first);
 			// React resets the default here because its children only seed the
-			// initial value. Authored Octane children are a live text binding that
-			// owns the default, so clearing it would detach their Text node.
+			// initial value. Clearing it under a live child binding would detach
+			// that binding's Text node, and later updates would write outside the
+			// element.
 			else if (
 				!first &&
-				!hasNestedChildren &&
+				!childrenOwned &&
 				(STAGED_DOM?.view(textarea) ?? textarea).defaultValue !== ''
 			)
 				(STAGED_DOM?.view(textarea) ?? textarea).defaultValue = '';
@@ -32079,7 +32265,13 @@ function reconcileDeoptNode(
 		}
 		setDeoptDesc(el, value);
 		if (!hasHostPropContent(value)) {
-			reconcileDeoptChildren(el, value.children, ownerBlock);
+			reconcileDeoptChildren(
+				el,
+				isHtmlTextareaType(value.type, elNs)
+					? textareaChildText(value.children, rejectTextareaChild)
+					: value.children,
+				ownerBlock,
+			);
 		}
 		return el;
 	}
@@ -32647,6 +32839,43 @@ function descNeedsBlocks(value: any): boolean {
 	return false;
 }
 
+// An HTML tag name is ASCII case-insensitive (`createElement('TEXTAREA')` makes
+// a textarea), and the server folds on the lowercased tag (ssrHostElement).
+// Compare the string before paying for a DOM accessor on every de-opt host.
+function isHtmlTextareaType(type: string, elNs: string | undefined): boolean {
+	return (
+		elNs === undefined &&
+		(type === 'textarea' || (type.length === 8 && type.toLowerCase() === 'textarea'))
+	);
+}
+
+// One childSlot renders a block-backed de-opt host's children into it. A
+// <textarea>'s children are text instead, like a compiled one's (see
+// textareaText): they fold to one string whose single Text node needs no slot
+// or range marker, since the server serialized them as one text run inside
+// RCDATA content (ssrHostElement). childTextHole adopts that text while
+// hydrating (`adopt`) and otherwise updates the element's existing Text node.
+function deoptHostChildren(
+	block: Block,
+	el: Element,
+	d: ElementDescriptor,
+	elNs: string | undefined,
+	adopt = false,
+): void {
+	if (!isHtmlTextareaType(d.type as string, elNs)) {
+		childSlot(block, 0, el, d.children, null, false, el);
+		return;
+	}
+	const text = adopt ? null : getFirstChild(el);
+	childTextHole(
+		block,
+		0,
+		el,
+		textareaChildText(d.children, rejectTextareaChild),
+		text?.nodeType === 3 ? (text as Text) : null,
+	);
+}
+
 // Stable render body for a HOST element produced via `createElement` (the de-opt
 // path) whose subtree contains COMPONENT descriptors — e.g. a `.tsx` component that
 // returns `<div className="n"><Node/><Node/></div>` from inside control flow (so the
@@ -32688,7 +32917,7 @@ function hostElementBody(d: ElementDescriptor, block: Block): void {
 		const savedCursor = getNextSibling(hydration.node);
 		if (!hasHostPropContent(d)) {
 			hydration.node = getFirstChild(el);
-			childSlot(block, 0, el, d.children, null, false, el);
+			deoptHostChildren(block, el, d, elNs, true);
 		}
 		hydration.node = savedCursor;
 		return;
@@ -32724,7 +32953,7 @@ function hostElementBody(d: ElementDescriptor, block: Block): void {
 		applyDeoptProps(el, d.props, block);
 		setDeoptDesc(el, d);
 		if (!hasHostPropContent(d)) {
-			hydration.suspend(() => childSlot(block, 0, el!, d.children, null, false, el!));
+			hydration.suspend(() => deoptHostChildren(block, el!, d, elNs));
 		}
 		return;
 	}
@@ -32778,7 +33007,7 @@ function hostElementBody(d: ElementDescriptor, block: Block): void {
 	// reconciles a single child (component/host/text) or an array (keyed list) and
 	// recurses into nested host-with-components subtrees uniformly. Skipped when
 	// dangerouslySetInnerHTML owns the content (see hasDangerHTML).
-	if (!hasHostPropContent(d)) childSlot(block, 0, el, d.children, null, false, el);
+	if (!hasHostPropContent(d)) deoptHostChildren(block, el, d, elNs);
 }
 
 // Stable render body for a componentSlot whose comp resolved to a HOST tag
@@ -34127,7 +34356,14 @@ export function childSlot(
 	}
 	// This call adopted the server's `<!--[-->…<!--]-->` pair as the slot's range.
 	let adoptedRange = false;
+	// The server rendered a primitive where this value begins, and that text is
+	// gone: build the value with hydration suspended, as a client mount would.
+	let rebuild = false;
 	if (state === undefined) {
+		// A compiled map's rows are the compiler's to frame; the rest of the list
+		// regime never serializes as bare text.
+		const framedList =
+			preparedList !== null && compiledMapBody === undefined && mappedFallback !== true;
 		const transaction = ROOT_RENDER_TRANSACTION;
 		if (
 			transaction !== null &&
@@ -34219,11 +34455,33 @@ export function childSlot(
 			// `Text` node (no start needed); the component path lazily mints a start
 			// marker when first required. Saves one comment per `{expr}` text hole.
 			start = null;
+			// Hydrating without a server range, as a return slot does. An owned
+			// host's text, such as an only-child hole's, is its owner's to judge.
+			if (hydration !== null && ownsHost === undefined)
+				rebuild = hydration.discardServerText(
+					parentScope,
+					slotKey,
+					domParent,
+					anchor ?? null,
+					value,
+					framedList,
+					false,
+				);
 			end = (STAGED_DOM?.view(document) ?? document).createComment('');
 			(STAGED_DOM?.view(domParent) ?? domParent).insertBefore(end, anchor ?? null);
 			if (hydration !== null && parentBlock === hydration.rootBlock)
 				hydration.protectRootAnchor(end);
 		}
+		if (adoptedRange)
+			rebuild = hydration!.discardServerText(
+				parentScope,
+				slotKey,
+				domParent,
+				end,
+				value,
+				framedList,
+				true,
+			);
 		state = {
 			__kind: 'childSlot',
 			start,
@@ -34331,6 +34589,22 @@ export function childSlot(
 	// element share one keyed-list regime. Keeping a keyed single child in this
 	// regime is what lets it retain state when a sibling is added around it.
 	if (preparedList !== null) {
+		if (rebuild) {
+			// Mount each item rather than look for server items that are not there.
+			const slot = state;
+			hydration!.suspend(() =>
+				renderPreparedChildList(
+					slot,
+					parentBlock,
+					domParent,
+					preparedList,
+					null,
+					upgradeArmed,
+					upgradeChildren,
+				),
+			);
+			return;
+		}
 		renderPreparedChildList(
 			state,
 			parentBlock,
@@ -34851,15 +35125,16 @@ export function childSlot(
 		}
 		state.block = b;
 		if (
-			adoptedRange &&
-			comp === (hostElementBody as unknown as ComponentBody) &&
-			!hydration!.claimHostRange(
-				parentScope,
-				slotKey,
-				state.start!,
-				state.end!,
-				(props as ElementDescriptor).type as string,
-			)
+			rebuild ||
+			(adoptedRange &&
+				comp === (hostElementBody as unknown as ComponentBody) &&
+				!hydration!.claimHostRange(
+					parentScope,
+					slotKey,
+					state.start!,
+					state.end!,
+					(props as ElementDescriptor).type as string,
+				))
 		) {
 			// The server range is gone: build the element and its subtree on the
 			// client, so no descendant adopts a node outside that range.
@@ -34881,6 +35156,7 @@ export function childSlot(
 	// Swapped away from a component OR a pure-host de-opt node → tear it down first.
 	if (state.block !== null || state.hostNode !== null) clearChildContent(state);
 	const str = coerceChildText(value);
+	if (adoptedRange) hydration!.discardUnadoptedText(parentScope, slotKey, state, str);
 	if (str === '') {
 		// `null` / `undefined` / `false` / `true` / `''` render NOTHING — not even
 		// an empty text node — matching React/Octane. The server emits an empty
@@ -35070,8 +35346,22 @@ export function childTextHole(
 		throw new Error(formatClientError(26, (domParent as Element).localName));
 	}
 	if (dangerouslySetInnerHTMLOwnsChild(domParent, value)) return null;
-	const vt = typeof value;
+	let vt = typeof value;
 	const state = parentScope.slots[slotKey] as ChildSlot | undefined;
+	// A <textarea>'s children are text (see textareaText); a `children` prop from
+	// a spread reaches it here. Only object values pay for the tag read. A signal
+	// handle keeps childSlot's subscribing path, which renders its value as text.
+	if (
+		state === undefined &&
+		(vt === 'object' || vt === 'function') &&
+		domParent.nodeType === 1 &&
+		(domParent as Element).localName === 'textarea' &&
+		(domParent as Element).namespaceURI === HTML_NS &&
+		!isSignalHandle(value)
+	) {
+		value = textareaChildText(value, rejectTextareaChild);
+		vt = 'string';
+	}
 	if (ROOT_RENDER_TRANSACTION !== null && state === undefined && parentScope.mounted) {
 		journalBag();
 		journalRootRange(domParent, null, null);
@@ -35097,12 +35387,19 @@ export function childTextHole(
 			return cachedNode;
 		}
 		const hydration = activeHydration();
-		if (hydration !== null) return hydration.htext(domParent, str, siteLoc(parentScope, slotKey));
-		const tn = (STAGED_DOM?.view(document) ?? document).createTextNode(str);
-		(STAGED_DOM?.view(domParent) ?? domParent).appendChild(tn);
-		return tn;
+		if (hydration === null) {
+			const tn = (STAGED_DOM?.view(document) ?? document).createTextNode(str);
+			(STAGED_DOM?.view(domParent) ?? domParent).appendChild(tn);
+			return tn;
+		}
+		// A server range around an element, component, or list is slot content
+		// markerless text cannot adopt: childSlot below adopts that range and
+		// discards what the text cannot use.
+		if (!hydration.framesSlotContent(domParent))
+			return hydration.htext(domParent, str, siteLoc(parentScope, slotKey));
 	}
-	// Object/function value (or already in slot mode): hand off to childSlot in
+	// Object/function value (or already in slot mode, or text the server framed
+	// slot content around on its first hydrating render): hand off to childSlot in
 	// OWNS-PARENT mode (marker-elision M4) — the hole is the host's SOLE child,
 	// which is exactly the ownerHost invariant, so component/element/array values
 	// render with NO markers at all (M2's de-opt host regime; arrays still mint
