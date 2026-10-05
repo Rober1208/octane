@@ -24913,6 +24913,9 @@ export class FragmentInstance {
 		type: string;
 		listener: EventListenerOrEventListenerObject;
 		options: AddEventListenerOptions | boolean | undefined;
+		capture: boolean;
+		signal: AbortSignal | undefined;
+		abort?: () => void;
 	}> | null;
 	/**
 	 * Observers registered via observeUsing. New direct children inherit each
@@ -24954,6 +24957,11 @@ export class FragmentInstance {
 		this._pendingChildren.clear();
 		this._portalAnchors?.clear();
 		this._portalAnchors = null;
+		if (this._listeners !== null) {
+			for (const entry of this._listeners) {
+				entry.signal?.removeEventListener('abort', entry.abort!);
+			}
+		}
 		this._listeners = null;
 		this._observers = null;
 	}
@@ -25099,17 +25107,35 @@ export class FragmentInstance {
 	): void {
 		if (this._destroyed) return;
 		const capture = listenerCapturePhase(options);
+		const signal = typeof options === 'object' ? options?.signal : undefined;
+		if (signal?.aborted) return;
 		if (!this._listeners) this._listeners = [];
 		for (const e of this._listeners) {
-			if (
-				e.type === type &&
-				e.listener === listener &&
-				listenerCapturePhase(e.options) === capture
-			) {
-				return; // already registered — no-op (DOM/React dedupe)
+			if (e.type === type && e.listener === listener && e.capture === capture) {
+				if (!e.signal?.aborted) return;
+				// An earlier abort handler can re-register before our cleanup runs.
+				this.removeEventListener(type, listener, capture);
+				break;
 			}
 		}
-		this._listeners.push({ type, listener, options });
+		// Native listeners snapshot their options; future children inherit the same values.
+		if (typeof options === 'object' && options !== null) {
+			options = { capture, signal, once: options.once, passive: options.passive };
+		}
+		const entry: NonNullable<FragmentInstance['_listeners']>[number] = {
+			type,
+			listener,
+			options,
+			capture,
+			signal,
+		};
+		this._listeners.push(entry);
+		if (signal) {
+			entry.abort = () => {
+				if (this._listeners?.includes(entry)) this.removeEventListener(type, listener, capture);
+			};
+			signal.addEventListener('abort', entry.abort, { once: true });
+		}
 		for (const child of fragmentDirectNodes(this)) {
 			(STAGED_DOM?.view(child) ?? child).addEventListener(type, listener, options as any);
 		}
@@ -25133,13 +25159,10 @@ export class FragmentInstance {
 			const entry = this._listeners[i];
 			if (entry.type !== type) continue;
 			if (entry.listener !== listener) continue;
-			if (listenerCapturePhase(entry.options) !== wantCapture) continue;
+			if (entry.capture !== wantCapture) continue;
+			entry.signal?.removeEventListener('abort', entry.abort!);
 			for (const child of fragmentDirectNodes(this)) {
-				(STAGED_DOM?.view(child) ?? child).removeEventListener(
-					type,
-					listener,
-					entry.options as any,
-				);
+				(STAGED_DOM?.view(child) ?? child).removeEventListener(type, listener, entry.capture);
 			}
 			this._listeners.splice(i, 1);
 			return;
