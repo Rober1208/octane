@@ -24,7 +24,7 @@ import type {
 	LayoutSnapshotOptions,
 	LayoutSnapshotOptionsWithInitial,
 } from './layout-snapshot-types.js';
-import { domBindingClaims } from './dom-binding-claims.js';
+import { domBindingClaims, repairedServerParents } from './dom-binding-claims.js';
 import { DOMStage } from './dom-stage.js';
 import { __normalizeBindingStyle } from './dom-binding-styles.js';
 import type { BindingHandle } from './dom-bindings.js';
@@ -15813,11 +15813,12 @@ function installHydrateInteraction(state: HydrateSlot, strategy: HydrationStrate
 
 	const onIntent = (event: Event) => {
 		if (wasEarlyHydrationIntentHandled(event) || hydrateBoundaryReleased(state)) return;
-		const rawTarget = event.target;
-		let target =
-			rawTarget instanceof Element
-				? rawTarget
-				: rawTarget instanceof Node
+		// Constructors belong to each window; iframe nodes need realm-neutral checks.
+		const rawTarget = eventPathNode(event.target);
+		const target =
+			rawTarget?.nodeType === 1
+				? (rawTarget as Element)
+				: rawTarget !== null
 					? (STAGED_DOM?.view(rawTarget) ?? rawTarget).parentElement
 					: null;
 		let marker: Element | null =
@@ -19419,6 +19420,8 @@ class HydrationCapability {
 	 * own rollback, once, within its arm's range when `parent` is the arm's parent.
 	 */
 	save(parent: Node): void {
+		// An early-bound host losing a server neighbor here has not moved.
+		repairedServerParents.add(parent);
 		if (inRootHydrationAttempt()) journalRootChildren(parent);
 		if (!this.speculative || (this.saved ??= new Set()).has(parent)) return;
 		this.saved.add(parent);
@@ -22666,6 +22669,46 @@ function hasClosedPresentationView(lease: BindingHandoff, scope: Scope, id: stri
 	}
 }
 
+/**
+ * A host moved off its server site cannot be adopted there, so hydration builds
+ * the renderer's own host in its place. Committing that replacement retires the
+ * displaced early owner without touching its moved DOM; a discarded attempt
+ * leaves it live, exactly like a suspended takeover.
+ */
+function supersedeDisplacedHost(
+	owner: RootRenderOwner,
+	id: string,
+	scope: Scope,
+	node: Node | null,
+): void {
+	const parent = node === null ? scope.block.parentNode : node.parentNode;
+	if (parent === null) return;
+	for (const lease of owner.bindingLeases!) {
+		if (
+			lease.id !== id ||
+			lease.host === undefined ||
+			!lease.active() ||
+			lease.displaced?.(parent, node) !== true
+		)
+			continue;
+		(WIP_CAPTURE!.renderCleanups ??= []).push((discarded) => {
+			const frame = PRESENTATION_PREPARATIONS.get(lease);
+			// Another live instance that adopted the moved host owns its takeover.
+			if (discarded || owner.disposed || (frame !== undefined && !frame.scope.block.disposed))
+				return;
+			if (!owner.bindingLeases!.delete(lease)) return;
+			PRESENTATION_PREPARATIONS.delete(lease);
+			releaseBindingHandoff(lease);
+			try {
+				lease.retire();
+			} catch (error) {
+				if (!reportUncaughtError(owner.current, error)) console.error(error);
+			}
+		});
+		return;
+	}
+}
+
 /** @internal Only compiler-proven native views enter this publication boundary. */
 export function beginPresentationHydration(
 	scope: Scope,
@@ -22701,7 +22744,10 @@ export function beginPresentationHydration(
 				(candidate.host !== undefined &&
 					PRESENTATION_PREPARATIONS.get(candidate)?.scope === scope)),
 	);
-	if (lease === undefined) return null;
+	if (lease === undefined) {
+		if (host && hydration !== null) supersedeDisplacedHost(owner, id, scope, hydration.node);
+		return null;
+	}
 	if (!lease.active()) throw new PresentationAdoptionMiss(lease, false);
 	if (host !== (lease.host !== undefined)) throw new PresentationAdoptionMiss(lease, false);
 	if (
