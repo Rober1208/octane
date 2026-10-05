@@ -2,4 +2,4 @@
 'octane': patch
 ---
 
-Allow Fragment event listeners to be registered again after their AbortSignal is aborted, and ignore registrations whose signal is already aborted.
+Fragment `addEventListener` now follows `AbortSignal` like `EventTarget`. Aborting the signal ends the registration, so the same callback can be added again. A signal that is already aborted registers nothing, and the options are copied when the listener is added.

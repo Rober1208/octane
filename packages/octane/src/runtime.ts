@@ -24958,10 +24958,10 @@ export class FragmentInstance {
 	_listeners: Array<{
 		type: string;
 		listener: EventListenerOrEventListenerObject;
-		options: AddEventListenerOptions | boolean | undefined;
-		capture: boolean;
-		signal: AbortSignal | undefined;
-		abort?: () => void;
+		/** Snapshot taken at registration, as EventTarget does; `capture` is a boolean. */
+		options: AddEventListenerOptions;
+		/** Drops this entry when `options.signal` aborts; detached on removal and teardown. */
+		abort: () => void;
 	}> | null;
 	/**
 	 * Observers registered via observeUsing. New direct children inherit each
@@ -25005,7 +25005,7 @@ export class FragmentInstance {
 		this._portalAnchors = null;
 		if (this._listeners !== null) {
 			for (const entry of this._listeners) {
-				entry.signal?.removeEventListener('abort', entry.abort!);
+				entry.options.signal?.removeEventListener('abort', entry.abort);
 			}
 		}
 		this._listeners = null;
@@ -25048,7 +25048,7 @@ export class FragmentInstance {
 				(STAGED_DOM?.view(child) ?? child).addEventListener(
 					entry.type,
 					entry.listener,
-					entry.options as any,
+					entry.options,
 				);
 			}
 		}
@@ -25066,7 +25066,7 @@ export class FragmentInstance {
 				(STAGED_DOM?.view(child) ?? child).removeEventListener(
 					entry.type,
 					entry.listener,
-					entry.options as any,
+					entry.options,
 				);
 			}
 		}
@@ -25145,6 +25145,11 @@ export class FragmentInstance {
 	 * The (type, listener, capture) tuple is stored so children inserted into
 	 * the fragment later inherit the listener. Deduped by that same tuple,
 	 * matching the DOM's listener identity rules.
+	 *
+	 * Like EventTarget, the options are copied at registration, an already
+	 * aborted signal registers nothing, and aborting the signal ends the
+	 * registration. The children's native listeners carry the same signal, so
+	 * the browser detaches them and the abort handler only drops the entry.
 	 */
 	addEventListener(
 		type: string,
@@ -25152,38 +25157,41 @@ export class FragmentInstance {
 		options?: AddEventListenerOptions | boolean,
 	): void {
 		if (this._destroyed) return;
-		const capture = listenerCapturePhase(options);
-		const signal = typeof options === 'object' ? options?.signal : undefined;
-		if (signal?.aborted) return;
-		if (!this._listeners) this._listeners = [];
-		for (const e of this._listeners) {
-			if (e.type === type && e.listener === listener && e.capture === capture) {
-				if (!e.signal?.aborted) return;
-				// An earlier abort handler can re-register before our cleanup runs.
-				this.removeEventListener(type, listener, capture);
-				break;
+		// A boolean or omitted argument has no members, so these reads are undefined.
+		const given = options as AddEventListenerOptions | undefined;
+		const snapshot: AddEventListenerOptions = {
+			capture: listenerCapturePhase(options),
+			signal: given?.signal,
+			once: given?.once,
+			passive: given?.passive,
+		};
+		if (snapshot.signal?.aborted) return;
+		const listeners = (this._listeners ??= []);
+		for (const e of listeners) {
+			// Native abort removal runs before every abort handler, so an aborted entry
+			// is already gone for an earlier handler that registers the callback again.
+			if (
+				e.type === type &&
+				e.listener === listener &&
+				e.options.capture === snapshot.capture &&
+				!e.options.signal?.aborted
+			) {
+				return; // already registered — no-op (DOM/React dedupe)
 			}
-		}
-		// Native listeners snapshot their options; future children inherit the same values.
-		if (typeof options === 'object' && options !== null) {
-			options = { capture, signal, once: options.once, passive: options.passive };
 		}
 		const entry: NonNullable<FragmentInstance['_listeners']>[number] = {
 			type,
 			listener,
-			options,
-			capture,
-			signal,
+			options: snapshot,
+			abort: () => {
+				const index = listeners.indexOf(entry);
+				if (index >= 0) listeners.splice(index, 1);
+			},
 		};
-		this._listeners.push(entry);
-		if (signal) {
-			entry.abort = () => {
-				if (this._listeners?.includes(entry)) this.removeEventListener(type, listener, capture);
-			};
-			signal.addEventListener('abort', entry.abort, { once: true });
-		}
+		listeners.push(entry);
+		snapshot.signal?.addEventListener('abort', entry.abort, { once: true });
 		for (const child of fragmentDirectNodes(this)) {
-			(STAGED_DOM?.view(child) ?? child).addEventListener(type, listener, options as any);
+			(STAGED_DOM?.view(child) ?? child).addEventListener(type, listener, snapshot);
 		}
 	}
 
@@ -25205,10 +25213,10 @@ export class FragmentInstance {
 			const entry = this._listeners[i];
 			if (entry.type !== type) continue;
 			if (entry.listener !== listener) continue;
-			if (entry.capture !== wantCapture) continue;
-			entry.signal?.removeEventListener('abort', entry.abort!);
+			if (entry.options.capture !== wantCapture) continue;
+			entry.options.signal?.removeEventListener('abort', entry.abort);
 			for (const child of fragmentDirectNodes(this)) {
-				(STAGED_DOM?.view(child) ?? child).removeEventListener(type, listener, entry.capture);
+				(STAGED_DOM?.view(child) ?? child).removeEventListener(type, listener, entry.options);
 			}
 			this._listeners.splice(i, 1);
 			return;

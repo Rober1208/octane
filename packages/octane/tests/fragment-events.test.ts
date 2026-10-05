@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { FragmentInstance } from 'octane';
 import { mount } from './_helpers';
-import { SingleChild, TwoChildren } from './conformance/_fixtures/fragment-refs-events.tsrx';
+import {
+	EmptyFragment,
+	SingleChild,
+	TwoChildren,
+} from './conformance/_fixtures/fragment-refs-events.tsrx';
 import { FutureChildren } from './conformance/_fixtures/fragment-future.tsrx';
 
 describe('Fragment event listener signals', () => {
@@ -192,6 +196,56 @@ describe('Fragment event listener signals', () => {
 			first.abort();
 			second.abort();
 			r.unmount();
+		}
+	});
+
+	// With no fragment listener, a bubbling dispatchEvent goes straight to the
+	// parent; any registration routes it through a fragment-local target.
+	it('stops counting a registration as a listener once its signal aborts', () => {
+		const fragRef: { current: FragmentInstance | null } = { current: null };
+		const r = mount(SingleChild, { fragRef });
+		const parent = r.find('#parent')!;
+		const aborted = new AbortController();
+		const live = new AbortController();
+		const targets: boolean[] = [];
+		const record = (event: Event) => targets.push(event.target === parent);
+		const dispatch = () => fragRef.current!.dispatchEvent(new Event('ping', { bubbles: true }));
+		parent.addEventListener('ping', record);
+		try {
+			aborted.abort();
+			fragRef.current!.addEventListener('ping', () => {}, { signal: aborted.signal });
+			dispatch();
+			fragRef.current!.addEventListener('ping', () => {}, { signal: live.signal });
+			dispatch();
+			live.abort();
+			dispatch();
+			expect(targets).toEqual([true, false, true]);
+		} finally {
+			live.abort();
+			parent.removeEventListener('ping', record);
+			r.unmount();
+		}
+	});
+
+	// No children, so the only abort listeners on the signal are the fragment's.
+	it('releases its abort handlers on removal and unmount', () => {
+		const fragRef: { current: FragmentInstance | null } = { current: null };
+		const r = mount(EmptyFragment, { fragRef });
+		const controller = new AbortController();
+		const added = vi.spyOn(controller.signal, 'addEventListener');
+		const removed = vi.spyOn(controller.signal, 'removeEventListener');
+		const removedListener = () => {};
+		try {
+			fragRef.current!.addEventListener('click', removedListener, { signal: controller.signal });
+			fragRef.current!.addEventListener('click', () => {}, { signal: controller.signal });
+			fragRef.current!.removeEventListener('click', removedListener);
+			r.unmount();
+			const handlers = added.mock.calls.filter(([type]) => type === 'abort').map(([, h]) => h);
+			const released = removed.mock.calls.filter(([type]) => type === 'abort').map(([, h]) => h);
+			expect(handlers.length).toBeGreaterThan(0);
+			expect(new Set(released)).toEqual(new Set(handlers));
+		} finally {
+			controller.abort();
 		}
 	});
 });
