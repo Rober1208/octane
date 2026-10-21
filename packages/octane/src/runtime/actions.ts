@@ -27,7 +27,7 @@ import {
 	startTransition,
 } from './transitions.js';
 import { CURSOR } from './hydration.js';
-import { reassertControlledIn } from './portals.js';
+import { type PortalStart, reassertControlledIn } from './portals.js';
 import { findTryHandler } from './suspense.js';
 import { CURRENT_SCOPE, CURRENT_BLOCK } from './render.js';
 import { setAttribute } from './host-props.js';
@@ -514,11 +514,26 @@ function findAncestorForm(block: Block): HTMLFormElement | null {
 	// which may be the <form> this component renders.
 	const start = block.startMarker;
 	let n: Node | null = start ? start.parentNode : (block.parentNode ?? null);
+	// React reads form status through the component tree, so portal content
+	// belongs to the <form> around its createPortal call, not to whatever
+	// contains the portal's target: leaving a portal's range continues the walk
+	// from its logical host.
+	let portal = enclosingPortal(block);
 	while (n) {
+		if (portal !== null && n === portal.parentNode) {
+			n = (portal.startMarker as PortalStart).$$portalSlot.host;
+			portal = enclosingPortal(portal.parentBlock);
+			continue;
+		}
 		if ((n as any).nodeName === 'FORM') return n as HTMLFormElement;
 		n = n.parentNode;
 	}
 	return null;
+}
+
+function enclosingPortal(block: Block | null): Block | null {
+	while (block !== null && block.kind !== 'portal') block = block.parentBlock;
+	return block;
 }
 
 interface FormStatusSlot {

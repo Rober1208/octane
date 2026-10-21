@@ -9,6 +9,11 @@ import {
 	StatusProbe,
 	SelfFormStatus,
 	NestedSelfFormStatus,
+	PortaledFormStatus,
+	PortaledNestedFormStatus,
+	FormWithStatusPortal,
+	DoublyPortaledFormStatus,
+	UnownedStatusPortal,
 	OptimisticForm,
 	BareOptimistic,
 	OptimisticCounter,
@@ -321,6 +326,63 @@ describe('useFormStatus', () => {
 		d.resolve();
 		await settle();
 		r.unmount();
+	});
+
+	it.each([
+		['as the portal body', PortaledFormStatus],
+		['below a host element in the portal body', PortaledNestedFormStatus],
+		['in a portal a child component returns', FormWithStatusPortal],
+		['in a portal nested inside another portal', DoublyPortaledFormStatus],
+	])('reports the logical parent form’s status to a reader rendered %s', async (_, App) => {
+		// The portal target is outside the <form>, so a walk over DOM parents never
+		// meets it. React reads form status through the component tree.
+		const target = document.createElement('div');
+		document.body.appendChild(target);
+		const d = deferred();
+		const r = mount(App, { action: () => d.promise, target });
+		const status = () => target.querySelector('#portal-status')!.textContent;
+		try {
+			expect(status()).toBe('idle');
+
+			submit(r.container);
+			expect(status()).toBe('pending:post');
+
+			d.resolve();
+			await settle();
+			expect(status()).toBe('idle');
+		} finally {
+			// Settle the action even on failure so its transition can't leak.
+			d.resolve();
+			await settle();
+			r.unmount();
+			target.remove();
+		}
+	});
+
+	it('ignores a form that only physically contains a portal target', async () => {
+		// The target sits inside another component's pending <form>, but the
+		// reader's own tree renders no form around the portal: it stays idle.
+		const d = deferred();
+		const owner = mount(RawFormWithStatus, { action: () => d.promise });
+		const target = document.createElement('div');
+		owner.find('form').appendChild(target);
+		const r = mount(UnownedStatusPortal, { target, label: 'a' });
+		// Re-render the reader once its range is in the target.
+		r.update(UnownedStatusPortal, { target, label: 'b' });
+		const status = () => target.querySelector('#portal-status')!.textContent;
+		try {
+			expect(target.querySelector('#portal-status')!.getAttribute('data-label')).toBe('b');
+			expect(status()).toBe('idle');
+
+			submit(owner.container);
+			expect(owner.find('#status').textContent).toBe('pending:post');
+			expect(status()).toBe('idle');
+		} finally {
+			d.resolve();
+			await settle();
+			r.unmount();
+			owner.unmount();
+		}
 	});
 
 	it('clears pending when a raw form action throws synchronously', async () => {

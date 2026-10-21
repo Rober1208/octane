@@ -1,4 +1,4 @@
-import { useActionState, useFormStatus, useOptimistic, useState } from 'octane';
+import { createPortal, useActionState, useFormStatus, useOptimistic, useState } from 'octane';
 
 // useActionState wired to <form action={formAction}>. The action receives
 // (previousState, formData) and its resolved value becomes the new state.
@@ -92,6 +92,76 @@ export function NestedSelfFormStatus(props) @{
 	<section>
 		<SelfFormStatus action={props.action} expose={props.expose} />
 	</section>
+}
+
+// useFormStatus read through a portal. The reader's DOM lives in a foreign
+// target outside the <form>, but its logical parent is still the form (React
+// parity: the status flows through the component tree, like context).
+function PortalStatusReader(props: { label?: string }) @{
+	const status = useFormStatus();
+	<span id="portal-status" data-label={props.label}>
+		{(status.pending ? 'pending:' + status.method : 'idle') as string}
+	</span>
+}
+
+interface PortaledFormProps {
+	action: (data: FormData) => Promise<void>;
+	target: Element;
+}
+
+// The reader is the portal body itself.
+export function PortaledFormStatus(props: PortaledFormProps) @{
+	<form action={props.action}>
+		{createPortal(<PortalStatusReader />, props.target)}
+		<button id="submit" type="submit">
+			{'go'}
+		</button>
+	</form>
+}
+
+// The reader sits below a host element inside a render-function portal body.
+export function PortaledNestedFormStatus(props: PortaledFormProps) @{
+	<form action={props.action}>
+		{createPortal(() => @{
+			<div class="portal-content">
+				<PortalStatusReader />
+			</div>
+		}, props.target)}
+		<button id="submit" type="submit">
+			{'go'}
+		</button>
+	</form>
+}
+
+// The reader is in a portal nested inside another portal's content.
+export function DoublyPortaledFormStatus(props: PortaledFormProps) @{
+	<form action={props.action}>
+		{createPortal(() => @{
+			<div class="outer-portal">{createPortal(<PortalStatusReader />, props.target)}</div>
+		}, document.body)}
+		<button id="submit" type="submit">
+			{'go'}
+		</button>
+	</form>
+}
+
+// A child component returns the portal as its value.
+function StatusPortal(props: { target: Element }) {
+	return createPortal(<PortalStatusReader />, props.target);
+}
+export function FormWithStatusPortal(props: PortaledFormProps) @{
+	<form action={props.action}>
+		<StatusPortal target={props.target} />
+		<button id="submit" type="submit">
+			{'go'}
+		</button>
+	</form>
+}
+
+// A portal with no logical ancestor form, used with a target that sits inside
+// someone else's <form>: that form is not the reader's parent.
+export function UnownedStatusPortal(props: { label: string; target: Element }) @{
+	<section>{createPortal(<PortalStatusReader label={props.label} />, props.target)}</section>
 }
 
 // useOptimistic: optimisticState shows the pending value during the action, then

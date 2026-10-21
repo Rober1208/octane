@@ -90,6 +90,13 @@ export interface PortalSlot {
 	interleavedFragment?: FragmentInstance;
 }
 
+/**
+ * A portal Block's start marker names its slot from creation on, so code below
+ * the portal can reach its logical host (the slot's current `host`) during the
+ * portal's first render, before its content is stamped with `$$portalParent`.
+ */
+export type PortalStart = Comment & { $$portalSlot: PortalSlot };
+
 export function installPortalEvents(): void {
 	if (preparePortalEventOwners === noop) {
 		preparePortalEventOwners = prepareRegisteredPortalEventOwners;
@@ -460,6 +467,7 @@ export function renderPortalState(
 			end,
 			registered: false,
 		};
+		(start as PortalStart).$$portalSlot = state;
 		if (host.nodeType === 11) noteFrontierMember(host, state);
 		activityPortalCreated?.(block);
 		if (into !== target) {
